@@ -245,15 +245,31 @@ def upsert_result(round_id, competitor_id, solves):
 
 def get_overall_leaderboard(metric="single"):
     col = "best" if metric == "single" else "average"
+    
     conn = get_conn()
+    
+    # This query finds the best time AND the competition where it was achieved
     df = pd.read_sql_query(f"""
-        SELECT c.name, MIN(r.{col}) as best, COUNT(r.id) as competitions
+        SELECT 
+            c.name,
+            r.{col} AS best,
+            comp.name AS competition,
+            COUNT(*) OVER (PARTITION BY c.id) AS competitions
         FROM results r
         JOIN competitors c ON c.id = r.competitor_id
+        JOIN rounds rd ON rd.id = r.round_id
+        JOIN competitions comp ON comp.id = rd.competition_id
         WHERE r.{col} IS NOT NULL
+          AND r.{col} = (
+              SELECT MIN(r2.{col})
+              FROM results r2
+              WHERE r2.competitor_id = r.competitor_id
+                AND r2.{col} IS NOT NULL
+          )
         GROUP BY c.id
         ORDER BY best ASC
     """, conn)
+    
     conn.close()
     return df
 
@@ -306,44 +322,68 @@ def login_form():
 
 # ─── Pages ───
 def page_home():
-    st.markdown(f'<div class="wca-header"><h1>9A4CA</h1><div class="sub">Class Cubing Association</div></div>', unsafe_allow_html=True)
+    st.markdown(f'''
+    <div class="wca-header">
+        <h1>9A4CA</h1>
+        <div class="sub">Class Cubing Association</div>
+    </div>
+    ''', unsafe_allow_html=True)
+
     comps = list_competitions()
     competitors = list_competitors()
-    overall = get_overall_leaderboard("single")
+    overall_single = get_overall_leaderboard("single")
+    overall_avg = get_overall_leaderboard("average")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Competitors", len(competitors))
     c2.metric("Competitions", len(comps))
-    best = format_time(overall["best"].iloc[0]) if not overall.empty else "—"
+    best = format_time(overall_single["best"].iloc[0]) if not overall_single.empty else "—"
     c3.metric("Best Single", best)
 
     st.markdown("---")
-    st.subheader("🏆 Overall Rankings (Best Single)")
-    render_overall_table(overall)
 
+    st.subheader("🏆 Overall Rankings (Best Single)")
+    render_overall_table(overall_single)
+
+    st.subheader("📊 Overall Rankings (Best Average)")
+    render_overall_table(overall_avg)
+
+    st.markdown("---")
     st.subheader("📅 Competitions")
+    
     if comps.empty:
         st.info("No competitions yet.")
     else:
         for _, row in comps.iterrows():
             with st.expander(f"**{row['name']}** — {row['date']} ({row['round_count']} rounds)"):
                 st.write(f"📍 {row['location'] or '—'}")
-                if st.button("View results", key=f"v{row['id']}"):
+                if st.button("View results", key=f"home_view_{row['id']}"):
                     st.session_state.selected_comp = int(row["id"])
                     st.session_state.page = "Competition Results"
+                    st.rerun()
                     st.rerun()
 
 def render_overall_table(df):
     if df.empty:
         st.info("No results yet.")
         return
-    html = '<table class="rank-table"><thead><tr><th>#</th><th>Name</th><th>Result</th><th>Rounds</th></tr></thead><tbody>'
-    for i, row in df.iterrows():
-        rank = i + 1
-        cls = f"rank-{rank}" if rank <= 3 else ""
-        html += f'<tr><td class="{cls}">{rank}</td><td><span class="name-link">{row["name"]}</span></td><td class="result-time">{format_time(row["best"])}</td><td>{int(row["competitions"])}</td></tr>'
-    html += '</tbody></table>'
-    st.markdown(html, unsafe_allow_html=True)
+
+    display = df.copy()
+    display.insert(0, "#", range(1, len(display) + 1))
+    display["Result"] = display["best"].apply(format_time)
+
+    display = display.rename(columns={
+        "name": "Name",
+        "competition": "Competition",
+        "competitions": "Rounds"
+    })
+
+    show_cols = ["#", "Name", "Result", "Competition", "Rounds"]
+    st.dataframe(
+        display[show_cols],
+        use_container_width=True,
+        hide_index=True
+    )
 
 def page_competitions():
     st.markdown(f'<div class="wca-header"><h1>Competitions</h1><div class="sub">All 9A4CA competitions</div></div>', unsafe_allow_html=True)
@@ -443,8 +483,15 @@ def page_competition_results():
         st.session_state.selected_comp = None
         st.rerun()
 def page_overall():
-    st.markdown(f'<div class="wca-header"><h1>Rankings</h1><div class="sub">Overall best times</div></div>', unsafe_allow_html=True)
+    st.markdown(f'''
+    <div class="wca-header">
+        <h1>Rankings</h1>
+        <div class="sub">Best times across all 9A4CA competitions</div>
+    </div>
+    ''', unsafe_allow_html=True)
+
     metric = st.radio("Type", ["Single", "Average"], horizontal=True)
+    
     df = get_overall_leaderboard("single" if metric == "Single" else "average")
     render_overall_table(df)
 
