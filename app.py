@@ -116,21 +116,48 @@ def parse_time(text):
         return None
 
 def calculate_average_and_best(solves):
-    """Calculate ao5 (or mo3) and best single from list of times (None = DNF)."""
-    valid = [s for s in solves if s is not None]
-    if not valid:
-        return None, None
-    best = min(valid)
-    if len(valid) < 3:          # not enough for average
+    """
+    Proper WCA-style Average of 5 (ao5).
+    - Removes best and worst
+    - Averages the middle 3
+    - Handles DNFs correctly
+    """
+    # solves is a list of 5 values (float or None). None = DNF
+    if len(solves) < 5:
+        # pad with None if needed
+        solves = solves + [None] * (5 - len(solves))
+    
+    solves = solves[:5]
+
+    # Count DNFs
+    dnf_count = sum(1 for s in solves if s is None)
+
+    # Best single (ignore DNFs)
+    valid_times = [s for s in solves if s is not None]
+    best = min(valid_times) if valid_times else None
+
+    # If 2 or more DNFs → Average is DNF
+    if dnf_count >= 2:
+        return None, best          # None means DNF for average
+
+    # For ranking purposes, treat DNF as a very large number
+    ranking_list = []
+    for s in solves:
+        if s is None:
+            ranking_list.append(float('inf'))   # DNF = worst
+        else:
+            ranking_list.append(s)
+
+    # Sort and remove best + worst
+    ranking_list.sort()
+    middle_three = ranking_list[1:4]   # remove index 0 (best) and index 4 (worst)
+
+    # If any of the middle three is DNF → Average = DNF
+    if float('inf') in middle_three:
         return None, best
-    # classic ao5: remove best and worst
-    if len(solves) == 5:
-        sorted_valid = sorted(valid)
-        if len(sorted_valid) >= 3:
-            avg = sum(sorted_valid[1:-1]) / (len(sorted_valid) - 2)
-            return round(avg, 2), best
-    # fallback mean
-    return round(sum(valid) / len(valid), 2), best
+
+    average = sum(middle_three) / 3
+    return round(average, 2), best
 
 # ─── Data functions ───
 def list_competitors():
