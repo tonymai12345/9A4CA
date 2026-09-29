@@ -560,37 +560,129 @@ def page_person():
     </div>
     ''', unsafe_allow_html=True)
 
+    # Get all results of this person (with competition date + event)
     res = sb.table("results").select(
         "*, rounds(name, event, format, competitions(name, date))"
     ).eq("competitor_id", person_id).execute()
 
     if not res.data:
         st.info("No results yet.")
-    else:
-        by_event = defaultdict(list)
-        for r in res.data:
-            event = r["rounds"]["event"] if r.get("rounds") else "333"
-            by_event[event].append(r)
+        if st.button("← Back"):
+            st.session_state.selected_person = None
+            st.session_state.page = "Home"
+            st.rerun()
+        return
 
-        for event_code, rows in by_event.items():
-            st.subheader(WCA_EVENTS.get(event_code, event_code))
-            data = []
-            for r in rows:
-                data.append({
-                    "Competition": r["rounds"]["competitions"]["name"] if r["rounds"].get("competitions") else "—",
-                    "Date": r["rounds"]["competitions"].get("date", "") if r["rounds"].get("competitions") else "",
-                    "Round": r["rounds"]["name"],
-                    "Format": FORMATS.get(r["rounds"].get("format", "ao5"), ""),
-                    "Average": format_time(r["average"]),
-                    "Best": format_time(r["best"]),
-                })
-            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+    # ---------- helpers for current & historical records ----------
+    def get_all_results_for_event(event_code):
+        """All results of everyone for one event (for class records)."""
+        r = sb.table("results").select(
+            "competitor_id, best, average, rounds!inner(event, competitions(date))"
+        ).eq("rounds.event", event_code).execute()
+        return r.data or []
+
+    # Group this person's results by event
+    by_event = defaultdict(list)
+    for r in res.data:
+        event = r["rounds"]["event"] if r.get("rounds") else "333"
+        by_event[event].append(r)
+
+    for event_code, rows in by_event.items():
+        event_name = WCA_EVENTS.get(event_code, event_code)
+        st.subheader(event_name)
+
+        # Current personal bests for this event
+        person_bests = []
+        person_avgs = []
+        for r in rows:
+            if r["best"] is not None:
+                person_bests.append(r["best"])
+            if r["average"] is not None:
+                person_avgs.append(r["average"])
+        current_pb_best = min(person_bests) if person_bests else None
+        current_pb_avg = min(person_avgs) if person_avgs else None
+
+        # Current class records for this event
+        all_event_results = get_all_results_for_event(event_code)
+        class_bests = [x["best"] for x in all_event_results if x["best"] is not None]
+        class_avgs = [x["average"] for x in all_event_results if x["average"] is not None]
+        current_cl_best = min(class_bests) if class_bests else None
+        current_cl_avg = min(class_avgs) if class_avgs else None
+
+        # Sort this person's results by competition date (oldest first)
+        def get_date(r):
+            try:
+                return r["rounds"]["competitions"].get("date") or "9999"
+            except:
+                return "9999"
+        rows_sorted = sorted(rows, key=get_date)
+
+        # Track running personal bests to detect former PRs
+        running_pb_best = None
+        running_pb_avg = None
+
+        data = []
+        for r in rows_sorted:
+            avg = r["average"]
+            best = r["best"]
+
+            # --- Average marks ---
+            avg_marks = ""
+            if avg is not None:
+                # Current PR
+                if current_pb_avg is not None and abs(avg - current_pb_avg) < 0.001:
+                    avg_marks += " 🔵PR"
+                # Former PR (was best at the time, but later broken)
+                elif running_pb_avg is None or avg < running_pb_avg:
+                    avg_marks += " ⚪ex-PR"
+                    running_pb_avg = avg
+                else:
+                    # still update running if better (shouldn't happen because of elif)
+                    pass
+
+                # Current Class Record
+                if current_cl_avg is not None and abs(avg - current_cl_avg) < 0.001:
+                    avg_marks += " 🟡CL"
+                # We don't easily know historical class records without more data,
+                # so we only mark current CL for average
+
+            # --- Best (single) marks ---
+            best_marks = ""
+            if best is not None:
+                if current_pb_best is not None and abs(best - current_pb_best) < 0.001:
+                    best_marks += " 🔵PR"
+                elif running_pb_best is None or best < running_pb_best:
+                    best_marks += " ⚪ex-PR"
+                    running_pb_best = best
+
+                if current_cl_best is not None and abs(best - current_cl_best) < 0.001:
+                    best_marks += " 🟡CL"
+
+            # Update running PBs after checking
+            if avg is not None:
+                if running_pb_avg is None or avg < running_pb_avg:
+                    running_pb_avg = avg
+            if best is not None:
+                if running_pb_best is None or best < running_pb_best:
+                    running_pb_best = best
+
+            data.append({
+                "Competition": r["rounds"]["competitions"]["name"] if r["rounds"].get("competitions") else "—",
+                "Date": r["rounds"]["competitions"].get("date", "") if r["rounds"].get("competitions") else "",
+                "Round": r["rounds"]["name"],
+                "Format": FORMATS.get(r["rounds"].get("format", "ao5"), ""),
+                "Average": format_time(avg) + avg_marks,
+                "Best": format_time(best) + best_marks,
+            })
+
+        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+
+    st.caption("🔵 **PR** = current Personal Record &nbsp;|&nbsp; 🟡 **CL** = current Class Record &nbsp;|&nbsp; ⚪ **ex-PR** = former Personal Record (broken)")
 
     if st.button("← Back"):
         st.session_state.selected_person = None
         st.session_state.page = "Home"
         st.rerun()
-
 def page_overall():
     st.markdown(f'''
     <div class="wca-header">
