@@ -427,6 +427,9 @@ def page_competition_results():
     comp_id = st.session_state.get("selected_comp")
     if not comp_id:
         st.warning("No competition selected")
+        if st.button("← Back to competitions"):
+            st.session_state.page = "Competitions"
+            st.rerun()
         return
 
     comp = get_competition(comp_id)
@@ -435,6 +438,7 @@ def page_competition_results():
         return
 
     rounds = get_rounds(comp_id)
+
     st.markdown(f'''
     <div class="wca-header">
         <h1>{comp["name"]}</h1>
@@ -446,12 +450,14 @@ def page_competition_results():
         st.warning("No rounds.")
         return
 
-    # Group rounds by event for nicer selection
+    # Nice labels for the selectbox
+    rounds = rounds.copy()
     rounds["label"] = rounds.apply(
-        lambda r: f"{WCA_EVENTS.get(r['event'], r['event'])} — {r['name']} ({FORMATS.get(r.get('format','ao5'), r.get('format','ao5'))})",
+        lambda r: f"{WCA_EVENTS.get(r.get('event', '333'), r.get('event', '333'))} — {r['name']} ({FORMATS.get(r.get('format', 'ao5'), 'ao5')})",
         axis=1
     )
-    selected_label = st.selectbox("Select Round", rounds["label"].tolist())
+
+    selected_label = st.selectbox("Select Round", rounds["label"].tolist(), key="round_selector")
     round_row = rounds[rounds["label"] == selected_label].iloc[0]
     round_id = int(round_row["id"])
     event = round_row.get("event", "333")
@@ -461,66 +467,74 @@ def page_competition_results():
     is_final = "final" in str(round_row["name"]).lower()
 
     results = get_results_for_round(round_id)
-    pbs = get_personal_bests(event)
-    class_rec = get_class_records(event)
 
     if results.empty:
-        st.info("No results yet.")
+        st.info("No results in this round yet.")
     else:
-        html = """
-        <table style="width:100%;border-collapse:collapse;font-size:0.92rem;">
-        <thead><tr style="background:#f0f2f5;">
-            <th style="padding:8px;text-align:left;">#</th>
-            <th style="padding:8px;text-align:left;">Name</th>
-            <th style="padding:8px;">1</th><th style="padding:8px;">2</th>
-            <th style="padding:8px;">3</th><th style="padding:8px;">4</th>
-            <th style="padding:8px;">5</th>
-            <th style="padding:8px;">Average</th><th style="padding:8px;">Best</th>
-        </tr></thead><tbody>
-        """
-        for i, row in results.iterrows():
-            rank = i + 1
-            rank_style = ""
-            if rank == 1: rank_style = "color:#d4af37;font-weight:700;"
-            elif rank == 2: rank_style = "color:#a8a8a8;font-weight:700;"
-            elif rank == 3: rank_style = "color:#cd7f32;font-weight:700;"
+        # Get PR & Class Record data
+        pbs = get_personal_bests(event)
+        class_rec = get_class_records(event)
 
+        def add_badges(value, pb_value, class_value):
+            """Return time string + PR/CL marks"""
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return "—"
+            text = format_time(value)
+            marks = ""
+            if pb_value is not None and abs(value - pb_value) < 0.001:
+                marks += " 🔵PR"
+            if class_value is not None and abs(value - class_value) < 0.001:
+                marks += " 🟡CL"
+            return text + marks
+
+        # Build clean dataframe
+        display_df = results.copy()
+        display_df.insert(0, "#", range(1, len(display_df) + 1))
+
+        display_df["1"] = display_df["solve1"].apply(format_time)
+        display_df["2"] = display_df["solve2"].apply(format_time)
+        display_df["3"] = display_df["solve3"].apply(format_time)
+        display_df["4"] = display_df["solve4"].apply(format_time)
+        display_df["5"] = display_df["solve5"].apply(format_time)
+
+        # Average & Best with badges
+        avg_list = []
+        best_list = []
+        for _, row in results.iterrows():
             cid = row.get("competitor_id")
             pb = pbs.get(cid, {"best": None, "average": None})
+            avg_list.append(add_badges(row["average"], pb["average"], class_rec["average"]))
+            best_list.append(add_badges(row["best"], pb["best"], class_rec["best"]))
 
-            avg_html = make_time_with_badges(row["average"], pb["average"], class_rec["average"])
-            best_html = make_time_with_badges(row["best"], pb["best"], class_rec["best"])
+        display_df["Average"] = avg_list
+        display_df["Best"] = best_list
+        display_df = display_df.rename(columns={"name": "Name"})
 
-            # Clickable name via button is hard in pure HTML, so we show name + separate buttons below
-            html += f"""
-            <tr style="border-bottom:1px solid #eee;">
-                <td style="padding:8px;{rank_style}">{rank}</td>
-                <td style="padding:8px;color:#c0392b;font-weight:500;">{row['name']}</td>
-                <td style="padding:8px;font-family:monospace;">{format_time(row['solve1'])}</td>
-                <td style="padding:8px;font-family:monospace;">{format_time(row['solve2'])}</td>
-                <td style="padding:8px;font-family:monospace;">{format_time(row['solve3'])}</td>
-                <td style="padding:8px;font-family:monospace;">{format_time(row['solve4'])}</td>
-                <td style="padding:8px;font-family:monospace;">{format_time(row['solve5'])}</td>
-                <td style="padding:8px;font-family:monospace;font-weight:600;">{avg_html}</td>
-                <td style="padding:8px;font-family:monospace;">{best_html}</td>
-            </tr>
-            """
-        html += "</tbody></table>"
-        st.markdown(html, unsafe_allow_html=True)
+        show_cols = ["#", "Name", "1", "2", "3", "4", "5", "Average", "Best"]
+        st.dataframe(
+            display_df[show_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=min(650, 45 + len(display_df) * 38)
+        )
 
-        # Clickable names (Streamlit buttons)
-        st.caption("Click a name to open personal page:")
+        st.caption("🔵 **PR** = Personal Record &nbsp;&nbsp;|&nbsp;&nbsp; 🟡 **CL** = Class Record")
+
+        # Clickable names → Personal page
+        st.markdown("#### Click a name to open personal page")
         cols = st.columns(4)
         for idx, row in results.iterrows():
             with cols[idx % 4]:
-                if st.button(row["name"], key=f"goto_person_{row['competitor_id']}_{round_id}"):
+                if st.button(f"👤 {row['name']}", key=f"person_{row['competitor_id']}_{round_id}"):
                     st.session_state.selected_person = int(row["competitor_id"])
                     st.session_state.page = "Person"
                     st.rerun()
 
         if is_final and len(results) > 0:
-            st.success(f"🏆 Champion: **{results.iloc[0]['name']}** (Avg: {format_time(results.iloc[0]['average'])})")
+            winner = results.iloc[0]
+            st.success(f"🏆 **Champion of {comp['name']}**: **{winner['name']}** (Average: {format_time(winner['average'])})")
 
+    st.markdown("---")
     if st.button("← Back to competitions"):
         st.session_state.selected_comp = None
         st.session_state.page = "Competitions"
