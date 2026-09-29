@@ -1,6 +1,10 @@
 """
 9A4CA — Class Cube Results
-Supports multi-round competitions + permanent Supabase storage
+Full version with:
+- Multi-event + Format support
+- PR / CL badges
+- Personal competitor pages
+- Supabase storage
 """
 
 import streamlit as st
@@ -10,7 +14,7 @@ import re
 import hashlib
 import sys
 import asyncio
-from collections import Counter
+from collections import Counter, defaultdict
 
 # ─── Windows fix ───
 if sys.platform == "win32":
@@ -24,11 +28,36 @@ ADMIN_USERNAME = "admin"
 DEFAULT_PASSWORD = "admin123"
 WCA_RED = "#96120C"
 WCA_BLUE = "#465D7B"
-WCA_DARK = "#1a1a2e"
 
 st.set_page_config(page_title="9A4CA Rankings", page_icon="🧊", layout="wide")
 
-# ─── Password helpers ───
+# ─── WCA Events & Formats ───
+WCA_EVENTS = {
+    "333": "3×3×3 Cube",
+    "222": "2×2×2 Cube",
+    "444": "4×4×4 Cube",
+    "555": "5×5×5 Cube",
+    "666": "6×6×6 Cube",
+    "777": "7×7×7 Cube",
+    "333bf": "3×3×3 Blindfolded",
+    "333oh": "3×3×3 One-Handed",
+    "clock": "Clock",
+    "minx": "Megaminx",
+    "pyram": "Pyraminx",
+    "skewb": "Skewb",
+    "sq1": "Square-1",
+}
+
+FORMATS = {
+    "ao5": "Average of 5",
+    "bo5": "Best of 5",
+    "bo3": "Best of 3",
+    "mo3": "Mean of 3",
+    "bo1": "Best of 1",
+    "bo2": "Best of 2",
+}
+
+# ─── Password ───
 def hash_password(p):
     return hashlib.sha256(p.encode()).hexdigest()
 
@@ -45,7 +74,6 @@ def get_supabase() -> Client:
     return create_client(url, key)
 
 def init_db():
-    """Ensure default admin password exists."""
     sb = get_supabase()
     try:
         res = sb.table("settings").select("value").eq("key", "admin_password_hash").execute()
@@ -54,15 +82,13 @@ def init_db():
                 "key": "admin_password_hash",
                 "value": hash_password(DEFAULT_PASSWORD)
             }).execute()
-    except Exception as e:
-        st.warning(f"Could not init settings: {e}")
+    except Exception:
+        pass
 
 def get_admin_hash():
     sb = get_supabase()
     res = sb.table("settings").select("value").eq("key", "admin_password_hash").execute()
-    if res.data:
-        return res.data[0]["value"]
-    return hash_password(DEFAULT_PASSWORD)
+    return res.data[0]["value"] if res.data else hash_password(DEFAULT_PASSWORD)
 
 def set_admin_password(pw):
     sb = get_supabase()
@@ -93,30 +119,37 @@ def parse_time(text):
     except:
         return None
 
-def calculate_average_and_best(solves):
-    """Proper WCA-style Average of 5 (ao5)."""
+def calculate_average_and_best(solves, fmt="ao5"):
+    """Support basic formats. Focus on ao5 / bo5 / mo3 / bo3."""
     if len(solves) < 5:
         solves = solves + [None] * (5 - len(solves))
     solves = solves[:5]
 
-    dnf_count = sum(1 for s in solves if s is None)
-    valid_times = [s for s in solves if s is not None]
-    best = min(valid_times) if valid_times else None
+    valid = [s for s in solves if s is not None]
+    best = min(valid) if valid else None
 
+    if fmt in ("bo1", "bo2", "bo3", "bo5"):
+        return None, best          # Best-of formats have no average
+
+    # Mean of 3
+    if fmt == "mo3":
+        if len(valid) < 3:
+            return None, best
+        return round(sum(valid[:3]) / 3, 2), best
+
+    # Average of 5 (default)
+    dnf_count = sum(1 for s in solves if s is None)
     if dnf_count >= 2:
         return None, best
 
-    ranking_list = [float("inf") if s is None else s for s in solves]
-    ranking_list.sort()
-    middle_three = ranking_list[1:4]
-
-    if float("inf") in middle_three:
+    ranking = [float("inf") if s is None else s for s in solves]
+    ranking.sort()
+    middle = ranking[1:4]
+    if float("inf") in middle:
         return None, best
+    return round(sum(middle) / 3, 2), best
 
-    average = sum(middle_three) / 3
-    return round(average, 2), best
-
-# ─── Data functions (Supabase) ───
+# ─── Data functions ───
 def list_competitors():
     sb = get_supabase()
     res = sb.table("competitors").select("*").order("name").execute()
@@ -144,12 +177,12 @@ def list_competitions():
     sb = get_supabase()
     comps = sb.table("competitions").select("*").order("date", desc=True).execute().data or []
     rounds = sb.table("rounds").select("competition_id").execute().data or []
-    round_count = Counter([r["competition_id"] for r in rounds])
+    cnt = Counter([r["competition_id"] for r in rounds])
     for c in comps:
-        c["round_count"] = round_count.get(c["id"], 0)
-    return pd.DataFrame(comps) if comps else pd.DataFrame(columns=["id", "name", "date", "location", "notes", "round_count"])
+        c["round_count"] = cnt.get(c["id"], 0)
+    return pd.DataFrame(comps) if comps else pd.DataFrame(columns=["id","name","date","location","notes","round_count"])
 
-def add_competition(name, comp_date, location, notes, round_names):
+def add_competition(name, comp_date, location, notes, round_names, events, fmt):
     sb = get_supabase()
     res = sb.table("competitions").insert({
         "name": name.strip(),
@@ -159,10 +192,16 @@ def add_competition(name, comp_date, location, notes, round_names):
     }).execute()
     comp_id = res.data[0]["id"]
 
-    rounds_data = [
-        {"competition_id": comp_id, "name": rname.strip(), "round_number": i}
-        for i, rname in enumerate(round_names, 1)
-    ]
+    rounds_data = []
+    for event in events:
+        for i, rname in enumerate(round_names, 1):
+            rounds_data.append({
+                "competition_id": comp_id,
+                "name": rname.strip(),
+                "round_number": i,
+                "event": event,
+                "format": fmt
+            })
     if rounds_data:
         sb.table("rounds").insert(rounds_data).execute()
     return comp_id
@@ -175,7 +214,7 @@ def get_competition(comp_id):
 def get_rounds(comp_id):
     sb = get_supabase()
     res = sb.table("rounds").select("*").eq("competition_id", comp_id).order("round_number").execute()
-    return pd.DataFrame(res.data) if res.data else pd.DataFrame(columns=["id", "name", "round_number"])
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame()
 
 def delete_competition(comp_id):
     sb = get_supabase()
@@ -189,50 +228,79 @@ def delete_competition(comp_id):
 def get_results_for_round(round_id):
     sb = get_supabase()
     res = sb.table("results").select("*, competitors(name)").eq("round_id", round_id).execute()
-    
     rows = []
     for r in (res.data or []):
         row = dict(r)
         row["name"] = r["competitors"]["name"] if r.get("competitors") else ""
         rows.append(row)
-    
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    
     df["avg_sort"] = df["average"].fillna(float("inf"))
     df["best_sort"] = df["best"].fillna(float("inf"))
     df = df.sort_values(["avg_sort", "best_sort"]).drop(columns=["avg_sort", "best_sort"])
     return df.reset_index(drop=True)
 
-def upsert_result(round_id, competitor_id, solves):
-    average, best = calculate_average_and_best(solves)
+def upsert_result(round_id, competitor_id, solves, fmt="ao5"):
+    average, best = calculate_average_and_best(solves, fmt)
     while len(solves) < 5:
         solves.append(None)
     solves = solves[:5]
-
     data = {
         "round_id": round_id,
         "competitor_id": competitor_id,
-        "solve1": solves[0],
-        "solve2": solves[1],
-        "solve3": solves[2],
-        "solve4": solves[3],
-        "solve5": solves[4],
-        "average": average,
-        "best": best
+        "solve1": solves[0], "solve2": solves[1], "solve3": solves[2],
+        "solve4": solves[3], "solve5": solves[4],
+        "average": average, "best": best
     }
     sb = get_supabase()
     sb.table("results").upsert(data, on_conflict="round_id,competitor_id").execute()
 
-def get_overall_leaderboard(metric="single"):
+def get_personal_bests(event="333"):
+    sb = get_supabase()
+    res = sb.table("results").select(
+        "competitor_id, best, average, rounds!inner(event)"
+    ).eq("rounds.event", event).execute()
+    pbs = {}
+    for r in (res.data or []):
+        cid = r["competitor_id"]
+        if cid not in pbs:
+            pbs[cid] = {"best": None, "average": None}
+        if r["best"] is not None and (pbs[cid]["best"] is None or r["best"] < pbs[cid]["best"]):
+            pbs[cid]["best"] = r["best"]
+        if r["average"] is not None and (pbs[cid]["average"] is None or r["average"] < pbs[cid]["average"]):
+            pbs[cid]["average"] = r["average"]
+    return pbs
+
+def get_class_records(event="333"):
+    sb = get_supabase()
+    res = sb.table("results").select(
+        "best, average, rounds!inner(event)"
+    ).eq("rounds.event", event).execute()
+    bests = [r["best"] for r in (res.data or []) if r["best"] is not None]
+    avgs = [r["average"] for r in (res.data or []) if r["average"] is not None]
+    return {
+        "best": min(bests) if bests else None,
+        "average": min(avgs) if avgs else None
+    }
+
+def make_time_with_badges(value, pb_value, class_value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    text = format_time(value)
+    badges = ""
+    if pb_value is not None and abs(value - pb_value) < 0.001:
+        badges += ' <span style="background:#2563eb;color:white;padding:1px 6px;border-radius:4px;font-size:0.7rem;font-weight:700;">PR</span>'
+    if class_value is not None and abs(value - class_value) < 0.001:
+        badges += ' <span style="background:#d97706;color:white;padding:1px 6px;border-radius:4px;font-size:0.7rem;font-weight:700;">CL</span>'
+    return f"{text}{badges}"
+
+def get_overall_leaderboard(event="333", metric="single"):
     col = "best" if metric == "single" else "average"
     sb = get_supabase()
-
-    res = sb.table("results")\
-        .select(f"competitor_id, {col}, competitors(name), rounds(competitions(name))")\
-        .not_.is_(col, "null")\
-        .execute()
+    res = sb.table("results").select(
+        f"competitor_id, {col}, competitors(name), rounds!inner(event, competitions(name))"
+    ).eq("rounds.event", event).not_.is_(col, "null").execute()
 
     if not res.data:
         return pd.DataFrame(columns=["name", "best", "competition", "competitions"])
@@ -245,16 +313,12 @@ def get_overall_leaderboard(metric="single"):
             "value": r[col],
             "competition": r["rounds"]["competitions"]["name"] if r.get("rounds") and r["rounds"].get("competitions") else ""
         })
-
     df = pd.DataFrame(records)
     idx = df.groupby("competitor_id")["value"].idxmin()
-    best_df = df.loc[idx].copy()
-    best_df = best_df.rename(columns={"value": "best"})
-
+    best_df = df.loc[idx].copy().rename(columns={"value": "best"})
     counts = df.groupby("competitor_id").size().rename("competitions")
     best_df = best_df.merge(counts, left_on="competitor_id", right_index=True)
-    best_df = best_df.sort_values("best").reset_index(drop=True)
-    return best_df[["name", "best", "competition", "competitions"]]
+    return best_df.sort_values("best").reset_index(drop=True)[["name", "best", "competition", "competitions"]]
 
 # ─── CSS ───
 def inject_css():
@@ -267,6 +331,11 @@ def inject_css():
     }}
     .wca-header h1 {{ color: white !important; margin: 0; font-size: 1.6rem; }}
     .wca-header .sub {{ font-size: 0.9rem; opacity: 0.9; }}
+    .name-btn {{
+        background: none; border: none; color: #c0392b; font-weight: 500;
+        cursor: pointer; padding: 0; text-align: left;
+    }}
+    .name-btn:hover {{ text-decoration: underline; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -293,15 +362,10 @@ def render_overall_table(df):
         st.info("No results yet.")
         return
     display = df.copy()
-    display.insert(0, "#", range(1, len(display) + 1))
+    display.insert(0, "#", range(1, len(display)+1))
     display["Result"] = display["best"].apply(format_time)
-    display = display.rename(columns={
-        "name": "Name",
-        "competition": "Competition",
-        "competitions": "Rounds"
-    })
-    st.dataframe(display[["#", "Name", "Result", "Competition", "Rounds"]],
-                 use_container_width=True, hide_index=True)
+    display = display.rename(columns={"name":"Name","competition":"Competition","competitions":"Rounds"})
+    st.dataframe(display[["#","Name","Result","Competition","Rounds"]], use_container_width=True, hide_index=True)
 
 def page_home():
     st.markdown(f'''
@@ -313,21 +377,20 @@ def page_home():
 
     comps = list_competitions()
     competitors = list_competitors()
-    overall_single = get_overall_leaderboard("single")
-    overall_avg = get_overall_leaderboard("average")
+    overall = get_overall_leaderboard("333", "single")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Competitors", len(competitors))
     c2.metric("Competitions", len(comps))
-    best = format_time(overall_single["best"].iloc[0]) if not overall_single.empty else "—"
-    c3.metric("Best Single", best)
+    best = format_time(overall["best"].iloc[0]) if not overall.empty else "—"
+    c3.metric("Best Single (3×3)", best)
 
     st.markdown("---")
-    st.subheader("🏆 Overall Rankings (Best Single)")
-    render_overall_table(overall_single)
+    st.subheader("🏆 Overall Rankings — 3×3×3 Single")
+    render_overall_table(overall)
 
-    st.subheader("📊 Overall Rankings (Best Average)")
-    render_overall_table(overall_avg)
+    st.subheader("📊 Overall Rankings — 3×3×3 Average")
+    render_overall_table(get_overall_leaderboard("333", "average"))
 
     st.markdown("---")
     st.subheader("📅 Competitions")
@@ -337,7 +400,7 @@ def page_home():
         for _, row in comps.iterrows():
             with st.expander(f"**{row['name']}** — {row['date']} ({row['round_count']} rounds)"):
                 st.write(f"📍 {row.get('location') or '—'}")
-                if st.button("View results", key=f"home_view_{row['id']}"):
+                if st.button("View results", key=f"home_{row['id']}"):
                     st.session_state.selected_comp = int(row["id"])
                     st.session_state.page = "Competition Results"
                     st.rerun()
@@ -349,12 +412,12 @@ def page_competitions():
         st.info("No competitions yet.")
         return
     for _, row in comps.iterrows():
-        col1, col2 = st.columns([5, 1])
+        col1, col2 = st.columns([5,1])
         with col1:
             st.markdown(f"### {row['name']}")
             st.caption(f"{row['date']} · {row.get('location') or '—'} · {row['round_count']} rounds")
         with col2:
-            if st.button("Results →", key=f"results_btn_{row['id']}"):
+            if st.button("Results →", key=f"comp_{row['id']}"):
                 st.session_state.selected_comp = int(row["id"])
                 st.session_state.page = "Competition Results"
                 st.rerun()
@@ -364,18 +427,14 @@ def page_competition_results():
     comp_id = st.session_state.get("selected_comp")
     if not comp_id:
         st.warning("No competition selected")
-        if st.button("← Back to competitions"):
-            st.session_state.page = "Competitions"
-            st.rerun()
         return
 
     comp = get_competition(comp_id)
     if not comp:
-        st.error("Competition not found.")
+        st.error("Competition not found")
         return
 
     rounds = get_rounds(comp_id)
-
     st.markdown(f'''
     <div class="wca-header">
         <h1>{comp["name"]}</h1>
@@ -384,59 +443,152 @@ def page_competition_results():
     ''', unsafe_allow_html=True)
 
     if rounds.empty:
-        st.warning("This competition has no rounds.")
+        st.warning("No rounds.")
         return
 
-    round_names = rounds["name"].tolist()
-    selected_round_name = st.selectbox("Select Round", round_names, key="round_selector")
-    round_row = rounds[rounds["name"] == selected_round_name].iloc[0]
+    # Group rounds by event for nicer selection
+    rounds["label"] = rounds.apply(
+        lambda r: f"{WCA_EVENTS.get(r['event'], r['event'])} — {r['name']} ({FORMATS.get(r.get('format','ao5'), r.get('format','ao5'))})",
+        axis=1
+    )
+    selected_label = st.selectbox("Select Round", rounds["label"].tolist())
+    round_row = rounds[rounds["label"] == selected_label].iloc[0]
     round_id = int(round_row["id"])
+    event = round_row.get("event", "333")
+    fmt = round_row.get("format", "ao5")
 
-    st.subheader(selected_round_name)
-    is_final = "final" in selected_round_name.lower()
+    st.subheader(f"{WCA_EVENTS.get(event, event)} — {round_row['name']}")
+    is_final = "final" in str(round_row["name"]).lower()
 
     results = get_results_for_round(round_id)
+    pbs = get_personal_bests(event)
+    class_rec = get_class_records(event)
 
     if results.empty:
-        st.info("No results in this round yet.")
+        st.info("No results yet.")
     else:
-        display_df = results.copy()
-        display_df.insert(0, "#", range(1, len(display_df) + 1))
-        display_df["1"] = display_df["solve1"].apply(format_time)
-        display_df["2"] = display_df["solve2"].apply(format_time)
-        display_df["3"] = display_df["solve3"].apply(format_time)
-        display_df["4"] = display_df["solve4"].apply(format_time)
-        display_df["5"] = display_df["solve5"].apply(format_time)
-        display_df["Average"] = display_df["average"].apply(format_time)
-        display_df["Best"] = display_df["best"].apply(format_time)
+        html = """
+        <table style="width:100%;border-collapse:collapse;font-size:0.92rem;">
+        <thead><tr style="background:#f0f2f5;">
+            <th style="padding:8px;text-align:left;">#</th>
+            <th style="padding:8px;text-align:left;">Name</th>
+            <th style="padding:8px;">1</th><th style="padding:8px;">2</th>
+            <th style="padding:8px;">3</th><th style="padding:8px;">4</th>
+            <th style="padding:8px;">5</th>
+            <th style="padding:8px;">Average</th><th style="padding:8px;">Best</th>
+        </tr></thead><tbody>
+        """
+        for i, row in results.iterrows():
+            rank = i + 1
+            rank_style = ""
+            if rank == 1: rank_style = "color:#d4af37;font-weight:700;"
+            elif rank == 2: rank_style = "color:#a8a8a8;font-weight:700;"
+            elif rank == 3: rank_style = "color:#cd7f32;font-weight:700;"
 
-        show_cols = ["#", "name", "1", "2", "3", "4", "5", "Average", "Best"]
-        display_df = display_df[show_cols].rename(columns={"name": "Name"})
+            cid = row.get("competitor_id")
+            pb = pbs.get(cid, {"best": None, "average": None})
 
-        st.dataframe(display_df, use_container_width=True, hide_index=True,
-                     height=min(600, 40 + len(display_df) * 38))
+            avg_html = make_time_with_badges(row["average"], pb["average"], class_rec["average"])
+            best_html = make_time_with_badges(row["best"], pb["best"], class_rec["best"])
 
-        if is_final:
-            winner_name = results.iloc[0]["name"]
-            winner_avg = format_time(results.iloc[0]["average"])
-            st.success(f"🏆 **Champion of {comp['name']}**: **{winner_name}** (Average: {winner_avg})")
+            # Clickable name via button is hard in pure HTML, so we show name + separate buttons below
+            html += f"""
+            <tr style="border-bottom:1px solid #eee;">
+                <td style="padding:8px;{rank_style}">{rank}</td>
+                <td style="padding:8px;color:#c0392b;font-weight:500;">{row['name']}</td>
+                <td style="padding:8px;font-family:monospace;">{format_time(row['solve1'])}</td>
+                <td style="padding:8px;font-family:monospace;">{format_time(row['solve2'])}</td>
+                <td style="padding:8px;font-family:monospace;">{format_time(row['solve3'])}</td>
+                <td style="padding:8px;font-family:monospace;">{format_time(row['solve4'])}</td>
+                <td style="padding:8px;font-family:monospace;">{format_time(row['solve5'])}</td>
+                <td style="padding:8px;font-family:monospace;font-weight:600;">{avg_html}</td>
+                <td style="padding:8px;font-family:monospace;">{best_html}</td>
+            </tr>
+            """
+        html += "</tbody></table>"
+        st.markdown(html, unsafe_allow_html=True)
 
-    st.markdown("---")
+        # Clickable names (Streamlit buttons)
+        st.caption("Click a name to open personal page:")
+        cols = st.columns(4)
+        for idx, row in results.iterrows():
+            with cols[idx % 4]:
+                if st.button(row["name"], key=f"goto_person_{row['competitor_id']}_{round_id}"):
+                    st.session_state.selected_person = int(row["competitor_id"])
+                    st.session_state.page = "Person"
+                    st.rerun()
+
+        if is_final and len(results) > 0:
+            st.success(f"🏆 Champion: **{results.iloc[0]['name']}** (Avg: {format_time(results.iloc[0]['average'])})")
+
     if st.button("← Back to competitions"):
-        st.session_state.page = "Competitions"
         st.session_state.selected_comp = None
+        st.session_state.page = "Competitions"
+        st.rerun()
+
+def page_person():
+    person_id = st.session_state.get("selected_person")
+    if not person_id:
+        st.warning("No competitor selected")
+        return
+
+    sb = get_supabase()
+    person_res = sb.table("competitors").select("*").eq("id", person_id).execute()
+    if not person_res.data:
+        st.error("Competitor not found")
+        return
+    person = person_res.data[0]
+
+    st.markdown(f'''
+    <div class="wca-header">
+        <h1>{person["name"]}</h1>
+        <div class="sub">Personal Results</div>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    res = sb.table("results").select(
+        "*, rounds(name, event, format, competitions(name, date))"
+    ).eq("competitor_id", person_id).execute()
+
+    if not res.data:
+        st.info("No results yet.")
+    else:
+        by_event = defaultdict(list)
+        for r in res.data:
+            event = r["rounds"]["event"] if r.get("rounds") else "333"
+            by_event[event].append(r)
+
+        for event_code, rows in by_event.items():
+            st.subheader(WCA_EVENTS.get(event_code, event_code))
+            data = []
+            for r in rows:
+                data.append({
+                    "Competition": r["rounds"]["competitions"]["name"] if r["rounds"].get("competitions") else "—",
+                    "Date": r["rounds"]["competitions"].get("date", "") if r["rounds"].get("competitions") else "",
+                    "Round": r["rounds"]["name"],
+                    "Format": FORMATS.get(r["rounds"].get("format", "ao5"), ""),
+                    "Average": format_time(r["average"]),
+                    "Best": format_time(r["best"]),
+                })
+            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+
+    if st.button("← Back"):
+        st.session_state.selected_person = None
+        st.session_state.page = "Home"
         st.rerun()
 
 def page_overall():
     st.markdown(f'''
     <div class="wca-header">
         <h1>Rankings</h1>
-        <div class="sub">Best times across all 9A4CA competitions</div>
+        <div class="sub">Best times across all competitions</div>
     </div>
     ''', unsafe_allow_html=True)
 
+    event = st.selectbox("Event", options=list(WCA_EVENTS.keys()),
+                         format_func=lambda x: WCA_EVENTS[x], index=0)
     metric = st.radio("Type", ["Single", "Average"], horizontal=True)
-    df = get_overall_leaderboard("single" if metric == "Single" else "average")
+    df = get_overall_leaderboard(event, "single" if metric == "Single" else "average")
     render_overall_table(df)
 
 def page_admin():
@@ -458,24 +610,43 @@ def page_admin():
             comp_date = st.date_input("Date", value=date.today())
             location = st.text_input("Location")
             notes = st.text_area("Notes")
-            st.markdown("**Rounds** (one per line)")
-            rounds_text = st.text_area("Round names", value="First Round\nSecond Round\nFinal", height=100)
+
+            selected_events = st.multiselect(
+                "Events *",
+                options=list(WCA_EVENTS.keys()),
+                format_func=lambda x: WCA_EVENTS[x],
+                default=["333"]
+            )
+            format_choice = st.selectbox(
+                "Format",
+                options=list(FORMATS.keys()),
+                format_func=lambda x: FORMATS[x]
+            )
+            rounds_text = st.text_area(
+                "Round names (one per line)",
+                value="First Round\nFinal",
+                height=80
+            )
+
             if st.form_submit_button("Create Competition", type="primary"):
                 if not name.strip():
                     st.error("Name required")
+                elif not selected_events:
+                    st.error("Select at least one event")
                 else:
                     round_names = [r.strip() for r in rounds_text.splitlines() if r.strip()]
                     if not round_names:
                         st.error("Add at least one round")
                     else:
-                        add_competition(name, str(comp_date), location, notes, round_names)
-                        st.success(f"Created **{name}** with {len(round_names)} rounds!")
+                        add_competition(name, str(comp_date), location, notes,
+                                        round_names, selected_events, format_choice)
+                        st.success(f"Created **{name}**!")
                         st.rerun()
 
         st.markdown("---")
         st.subheader("Existing Competitions")
         for _, row in list_competitions().iterrows():
-            c1, c2 = st.columns([5, 1])
+            c1, c2 = st.columns([5,1])
             with c1:
                 st.write(f"**{row['name']}** — {row['date']} ({row['round_count']} rounds)")
             with c2:
@@ -493,9 +664,8 @@ def page_admin():
                     st.success(msg) if ok else st.error(msg)
                     st.rerun()
         st.markdown("---")
-        st.subheader("All Competitors")
         for _, row in list_competitors().iterrows():
-            c1, c2 = st.columns([5, 1])
+            c1, c2 = st.columns([5,1])
             with c1:
                 st.write(row["name"])
             with c2:
@@ -508,52 +678,49 @@ def page_admin():
         comps = list_competitions()
         competitors = list_competitors()
         if comps.empty or competitors.empty:
-            st.warning("Create a competition and add competitors first.")
+            st.warning("Create competition and competitors first.")
         else:
             comp_options = {f"{r['name']} ({r['date']})": int(r["id"]) for _, r in comps.iterrows()}
-            selected_comp_label = st.selectbox("Competition", list(comp_options.keys()))
-            comp_id = comp_options[selected_comp_label]
-
+            selected_comp = st.selectbox("Competition", list(comp_options.keys()))
+            comp_id = comp_options[selected_comp]
             rounds = get_rounds(comp_id)
-            if rounds.empty:
-                st.error("This competition has no rounds.")
-            else:
-                round_options = {r["name"]: int(r["id"]) for _, r in rounds.iterrows()}
-                selected_round = st.selectbox("Round", list(round_options.keys()))
-                round_id = round_options[selected_round]
 
-                st.markdown(f"**Entering results for:** {selected_round}")
+            if rounds.empty:
+                st.error("No rounds.")
+            else:
+                rounds["label"] = rounds.apply(
+                    lambda r: f"{WCA_EVENTS.get(r['event'], r['event'])} — {r['name']}", axis=1)
+                selected_round_label = st.selectbox("Round", rounds["label"].tolist())
+                round_row = rounds[rounds["label"] == selected_round_label].iloc[0]
+                round_id = int(round_row["id"])
+                fmt = round_row.get("format", "ao5")
+
                 with st.form("enter_result"):
                     person = st.selectbox("Competitor", competitors["name"].tolist())
-                    st.markdown("**Solves** (leave empty or type DNF)")
+                    st.markdown("**Solves** (leave empty = DNF)")
                     cols = st.columns(5)
                     solves_str = []
                     for i, col in enumerate(cols):
                         with col:
-                            solves_str.append(st.text_input(f"Solve {i+1}", key=f"s{i}"))
-                    if st.form_submit_button("Save Result", type="primary"):
+                            solves_str.append(st.text_input(f"{i+1}", key=f"s{i}"))
+                    if st.form_submit_button("Save", type="primary"):
                         solves = [parse_time(s) for s in solves_str]
                         cid = get_competitor_id_by_name(person)
                         if cid:
-                            upsert_result(round_id, cid, solves)
-                            st.success(f"Saved for **{person}** in {selected_round}!")
+                            upsert_result(round_id, cid, solves, fmt)
+                            st.success(f"Saved for **{person}**!")
                             st.rerun()
 
                 st.markdown("---")
-                st.subheader(f"Current results — {selected_round}")
                 current = get_results_for_round(round_id)
-                if current.empty:
-                    st.info("No results yet.")
-                else:
+                if not current.empty:
                     display = current.copy()
-                    for i in range(1, 6):
+                    for i in range(1,6):
                         display[f"S{i}"] = display[f"solve{i}"].apply(format_time)
                     display["Avg"] = display["average"].apply(format_time)
                     display["Best"] = display["best"].apply(format_time)
-                    st.dataframe(
-                        display[["name", "S1", "S2", "S3", "S4", "S5", "Avg", "Best"]].rename(columns={"name": "Name"}),
-                        use_container_width=True, hide_index=True
-                    )
+                    st.dataframe(display[["name","S1","S2","S3","S4","S5","Avg","Best"]].rename(columns={"name":"Name"}),
+                                 use_container_width=True, hide_index=True)
 
     with tab4:
         st.subheader("Change Password")
@@ -564,10 +731,8 @@ def page_admin():
             if st.form_submit_button("Update"):
                 if not verify_password(cur, get_admin_hash()):
                     st.error("Wrong current password")
-                elif n1 != n2:
-                    st.error("Passwords don't match")
-                elif len(n1) < 6:
-                    st.error("Too short")
+                elif n1 != n2 or len(n1) < 6:
+                    st.error("Passwords don't match or too short")
                 else:
                     set_admin_password(n1)
                     st.success("Password changed!")
@@ -590,27 +755,32 @@ def main():
         st.session_state.page = "Home"
     if "selected_comp" not in st.session_state:
         st.session_state.selected_comp = None
+    if "selected_person" not in st.session_state:
+        st.session_state.selected_person = None
 
-    menu = st.sidebar.radio(
-        "Navigation",
+    menu = st.sidebar.radio("Navigation",
         ["🏠 Home", "📅 Competitions", "🏆 Rankings", "⚙️ Admin"],
-        key="sidebar_menu"
-    )
+        key="sidebar_menu")
 
     if menu == "🏠 Home":
         st.session_state.page = "Home"
         st.session_state.selected_comp = None
+        st.session_state.selected_person = None
     elif menu == "📅 Competitions":
-        if st.session_state.page != "Competition Results":
+        if st.session_state.page not in ("Competition Results", "Person"):
             st.session_state.page = "Competitions"
     elif menu == "🏆 Rankings":
         st.session_state.page = "Overall"
         st.session_state.selected_comp = None
+        st.session_state.selected_person = None
     elif menu == "⚙️ Admin":
         st.session_state.page = "Admin"
         st.session_state.selected_comp = None
+        st.session_state.selected_person = None
 
-    if st.session_state.selected_comp is not None:
+    if st.session_state.selected_person is not None:
+        st.session_state.page = "Person"
+    elif st.session_state.selected_comp is not None:
         st.session_state.page = "Competition Results"
 
     if st.session_state.page == "Home":
@@ -619,6 +789,8 @@ def main():
         page_competitions()
     elif st.session_state.page == "Competition Results":
         page_competition_results()
+    elif st.session_state.page == "Person":
+        page_person()
     elif st.session_state.page == "Overall":
         page_overall()
     elif st.session_state.page == "Admin":
